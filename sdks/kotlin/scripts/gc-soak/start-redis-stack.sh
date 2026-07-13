@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
-# Start a multi-service Golem stack for WasmGC soak, matching the storage model of
-# https://github.com/JohnSColeman/golem-agent-example/blob/infra/infra/docker/docker-compose.yaml
+# Start a multi-service Golem stack for WasmGC soak.
+# Topology/storage model match the proven agent-example docker-compose:
+#   https://github.com/JohnSColeman/golem-agent-example/blob/infra/infra/docker/docker-compose.yaml
 #
-#   - Postgres: registry DB
-#   - Redis:    worker-executor key-value + indexed storage (KVStoreRedis), gateway sessions
-#   - NO SQLite on registry or executor hot path
+#   - Postgres: registry + shard-manager DB
+#   - Redis:    executor key-value + indexed storage (KVStoreRedis), gateway sessions
+#   - Shared host blob root for registry / compilation / executor
+#   - NO SQLite on any hot path
 #
-# Golem services run as host debug binaries (WasmGC flags). Infra prefers Docker.
+# Golem services run as host debug binaries (WasmGC). Docker only for redis + postgres.
 # Writes $WORKDIR/stack.pids and $WORKDIR/stack.env.
 set -euo pipefail
 
@@ -14,7 +16,7 @@ WORKDIR="${1:?workdir}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
 DOCKER_DIR="$SCRIPT_DIR/docker"
-mkdir -p "$WORKDIR/data/blob" "$WORKDIR/data/shard" "$WORKDIR/logs"
+mkdir -p "$WORKDIR/data/blob" "$WORKDIR/logs"
 
 fail() { echo "FAIL: $*"; exit 1; }
 
@@ -180,27 +182,31 @@ start_svc compilation "$WORKDIR/logs/compilation.log" "$ROOT/golem-component-com
   GOLEM__GRPC__PORT="$COMPILATION_GRPC" \
   GOLEM__BLOB_STORAGE__TYPE=LocalFileSystem \
   GOLEM__BLOB_STORAGE__CONFIG__ROOT="$BLOB_ROOT" \
+  GOLEM__REGISTRY_SERVICE__TYPE=Static \
   GOLEM__REGISTRY_SERVICE__CONFIG__HOST=localhost \
   GOLEM__REGISTRY_SERVICE__CONFIG__PORT="$REGISTRY_GRPC" \
   RUST_LOG=info,h2=warn,hyper=warn,tower=warn \
   "$ROOT/target/debug/golem-component-compilation-service"
 wait_tcp 127.0.0.1 "$COMPILATION_GRPC" "compilation grpc"
 
-echo "== shard-manager (fresh sqlite under workdir — no stale pods) =="
-# Shard manager uses GOLEM__DB__* (not PERSISTENCE). Fresh DB avoids healthchecking dead executors.
-rm -f "$WORKDIR/data/shard"/*
+echo "== shard-manager (Postgres — same topology as proven agent-example compose) =="
+# Current shard-manager uses GOLEM__DB (Sqlite|Postgres); proven compose's Redis PERSISTENCE is gone.
+# Fresh Postgres volume from start_infra means no stale executor pods.
 start_svc shard_manager "$WORKDIR/logs/shard-manager.log" "$ROOT/golem-shard-manager" \
   GOLEM__HTTP_PORT="$SHARD_HTTP" \
   GOLEM__GRPC__PORT="$SHARD_GRPC" \
-  GOLEM__DB__TYPE=Sqlite \
-  GOLEM__DB__CONFIG__DATABASE="$WORKDIR/data/shard/golem_shard_manager.sqlite" \
+  GOLEM__DB__TYPE=Postgres \
+  GOLEM__DB__CONFIG__DATABASE="$PG_DB" \
+  GOLEM__DB__CONFIG__HOST=localhost \
+  GOLEM__DB__CONFIG__PORT="$PG_PORT" \
+  GOLEM__DB__CONFIG__USERNAME="$PG_USER" \
+  GOLEM__DB__CONFIG__PASSWORD="$PG_PASS" \
   GOLEM__DB__CONFIG__MAX_CONNECTIONS=10 \
-  GOLEM__DB__CONFIG__FOREIGN_KEYS=false \
+  GOLEM__DB__CONFIG__SCHEMA=golem_shard_manager \
   GOLEM__REGISTRY_SERVICE__HOST=localhost \
   GOLEM__REGISTRY_SERVICE__PORT="$REGISTRY_GRPC" \
   RUST_LOG=info,h2=warn,hyper=warn,tower=warn \
   "$ROOT/target/debug/golem-shard-manager"
-# Must wait for gRPC — initial healthcheck can delay bind if DB is dirty; with fresh DB it is fast.
 wait_tcp 127.0.0.1 "$SHARD_GRPC" "shard-manager grpc" 90
 
 echo "== worker-executor (Redis KV + KVStoreRedis — no SQLite) =="

@@ -6,6 +6,9 @@ const HOSTH = __ENV.HOST_HEADER;
 const AGENTS = parseInt(__ENV.AGENTS, 10);
 const RATE = parseInt(__ENV.RATE, 10);
 const VUS = parseInt(__ENV.VUS, 10);
+const CHURN = parseInt(__ENV.CHURN_OBJECTS || '20000', 10);
+// Soak/smoke: fail on any non-200. Regression matrix sets ENFORCE_THRESHOLDS=0.
+const ENFORCE = (__ENV.ENFORCE_THRESHOLDS || '1') !== '0';
 
 export const options = {
   scenarios: {
@@ -18,15 +21,22 @@ export const options = {
       maxVUs: VUS,
     },
   },
-  thresholds: {
-    http_req_failed: ['rate==0'], // any failed request -> non-zero k6 exit
-    checks: ['rate==1'],
-  },
+  thresholds: ENFORCE
+    ? {
+        http_req_failed: ['rate==0'],
+        checks: ['rate==1'],
+      }
+    : {},
 };
 
 export default function () {
-  const id = Math.floor(Math.random() * AGENTS); // spread across thousands of distinct agents
-  const res = http.post(`${BASE}/gcstress/${id}/churn`, null, { headers: { Host: HOSTH } });
+  const id = Math.floor(Math.random() * AGENTS);
+  // Path n = allocation count (GC workload). Timeout covers heavy concurrent churn.
+  const res = http.post(`${BASE}/gcstress/${id}/churn/${CHURN}`, null, {
+    headers: { Host: HOSTH },
+    timeout: __ENV.REQ_TIMEOUT || '120s',
+    tags: { churn: String(CHURN), vus_target: String(VUS) },
+  });
   check(res, { 'status 200': (r) => r.status === 200 });
 }
 

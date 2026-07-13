@@ -26,10 +26,12 @@ command -v k6 >/dev/null 2>&1 || fail "k6 not found on PATH (brew install k6)"
 
 # Mode-derived defaults; any knob may be overridden explicitly.
 if [ "$MODE" = "soak" ]; then
-  AGENTS="${AGENTS:-2000}"; DURATION="${DURATION:-30m}"; RATE="${RATE:-2000}"
-  VUS="${VUS:-256}"; CHURN_OBJECTS="${CHURN_OBJECTS:-60000}"
+  # Defaults sized for a single host executor: many agents + large per-call churn
+  # (WasmGC stress), not a synthetic 2k RPS that only produces client timeouts.
+  AGENTS="${AGENTS:-2000}"; DURATION="${DURATION:-30m}"; RATE="${RATE:-20}"
+  VUS="${VUS:-64}"; CHURN_OBJECTS="${CHURN_OBJECTS:-60000}"
 elif [ "$MODE" = "smoke" ]; then
-  AGENTS="${AGENTS:-50}"; DURATION="${DURATION:-60s}"; RATE="${RATE:-200}"
+  AGENTS="${AGENTS:-50}"; DURATION="${DURATION:-60s}"; RATE="${RATE:-20}"
   VUS="${VUS:-32}"; CHURN_OBJECTS="${CHURN_OBJECTS:-20000}"
 else
   fail "MODE must be smoke or soak (got '$MODE')"
@@ -113,7 +115,7 @@ fi
 echo "== warm a few agents =="
 for i in 0 1 2; do
   code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 120 \
-    -X POST "http://localhost:$CUSTOM_PORT/gcstress/$i/churn" \
+    -X POST "http://localhost:$CUSTOM_PORT/gcstress/$i/churn/$CHURN_OBJECTS" \
     -H 'Host: app.localhost:9006' || echo 000)
   echo "  warm agent $i -> HTTP $code"
   [ "$code" = "200" ] || fail "warm agent $i returned HTTP $code (expected 200); component download likely broken"
@@ -136,7 +138,8 @@ SAMPLER_PID=$!
 
 echo "== run k6 soak =="
 BASE_URL="http://localhost:$CUSTOM_PORT" HOST_HEADER="app.localhost:9006" \
-AGENTS="$AGENTS" RATE="$RATE" VUS="$VUS" DURATION="$DURATION" WORKDIR="$WORKDIR" \
+AGENTS="$AGENTS" RATE="$RATE" VUS="$VUS" DURATION="$DURATION" \
+CHURN_OBJECTS="$CHURN_OBJECTS" WORKDIR="$WORKDIR" \
   k6 run "$SCRIPT_DIR/gc-soak.k6.js"
 K6_RC=$?
 

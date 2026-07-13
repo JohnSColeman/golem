@@ -7,12 +7,16 @@ import cloud.golem.annotations.Endpoint
 import cloud.golem.annotations.Prompt
 
 /**
- * WasmGC allocation-churn stress agent. Each /churn invoke allocates a large graph of transient
+ * WasmGC allocation-churn stress agent. Each /churn/{n} invoke allocates a large graph of transient
  * objects that become unreachable before return, while rotating a small bounded live set so the
  * collector must TRACE survivors rather than trivially freeing everything. Over a sustained soak the
  * WasmGC heap is collected repeatedly or it OOMs -- so a plateau in the host process RSS is the
  * observable signature that collection is running. Compiled natively to Wasm (WasmGC) via
  * Kotlin/Wasm -- no JS, no QuickJS.
+ *
+ * The path parameter `n` is the per-call allocation count so regression matrices can vary GC
+ * workload without rebuilding the component. Smoke/soak pass a fixed CHURN_OBJECTS as `n`.
+ * A bare /churn endpoint keeps the sed-substituted DEFAULT_CHURN for older scripts.
  */
 @Agent(mount = "/gcstress/{id}", description = "WasmGC allocation-churn stress agent")
 class CounterAgent(val id: String) : BaseAgent() {
@@ -21,16 +25,22 @@ class CounterAgent(val id: String) : BaseAgent() {
     private val liveRing = arrayOfNulls<Any>(256)   // bounded live set -> GC must TRACE, not free-all
     private var cursor = 0
 
-    @Prompt("Allocate and discard a large transient object graph")
-    @Description("Churns WasmGC-managed allocations; returns a running checksum")
+    @Prompt("Allocate and discard a large transient object graph (default size)")
+    @Description("Churns DEFAULT_CHURN WasmGC allocations; returns a running checksum")
     @Endpoint(post = "/churn")
-    fun churn(): Long {
+    fun churn(): Long = churnN(DEFAULT_CHURN)
+
+    @Prompt("Allocate and discard n transient objects")
+    @Description("Churns n WasmGC-managed allocations; n controls GC workload for regression matrices")
+    @Endpoint(post = "/churn/{n}")
+    fun churnN(n: Int): Long {
+        val count = if (n > 0) n else DEFAULT_CHURN
         var acc = 0L
         val scratch = ArrayList<Node>(1024)
-        repeat(CHURN_OBJECTS) { i ->                 // CHURN_OBJECTS sed-substituted per mode
-            val n = Node(i, IntArray(16) { it + i }, "s$i")
-            acc += n.arr[i and 15] + n.label.length
-            scratch.add(n)
+        repeat(count) { i ->
+            val n0 = Node(i, IntArray(16) { it + i }, "s$i")
+            acc += n0.arr[i and 15] + n0.label.length
+            scratch.add(n0)
             if (scratch.size >= 1024) { acc += scratch[0].id; scratch.clear() } // let them die
         }
         liveRing[cursor % liveRing.size] = ByteArray(1024)   // rotate a bounded live set
@@ -47,3 +57,6 @@ class CounterAgent(val id: String) : BaseAgent() {
 }
 
 private class Node(val id: Int, val arr: IntArray, val label: String)
+
+// DEFAULT_CHURN sed-substituted per mode (smoke/soak); regression passes n on the path instead.
+private const val DEFAULT_CHURN = CHURN_OBJECTS
