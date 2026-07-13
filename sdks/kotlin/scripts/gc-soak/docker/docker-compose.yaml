@@ -1,0 +1,260 @@
+# Redis/Postgres-backed Golem stack for WasmGC soak (avoids MultiSqlite file-descriptor
+# exhaustion under thousands of concurrent agents).
+#
+# Layout mirrors https://github.com/JohnSColeman/golem-agent-example/blob/infra/infra/docker/docker-compose.yaml
+# Worker-executor uses Redis for indexed storage (oplog), not MultiSqlite.
+#
+# Golem service images are BUILT LOCALLY from this repo's Dockerfiles (kotlin-sdk-native /
+# WasmGC engine flags). They are NOT pulled from published golemservices images
+# (latest stable as of this work: v1.5.1 — still lacks this branch's WasmGC flags).
+#
+# Prerequisites for --profile full:
+#   1. Cross-compile release bins for the container arch (see build-images.sh)
+#   2. docker compose build
+#   3. docker compose --profile full up -d
+#
+# Usage:
+#   # redis only (SERVER_MODE=redis host multi-service path)
+#   docker compose -f docker-compose.yaml up -d redis
+#
+#   # full stack from local WasmGC images
+#   ./build-images.sh
+#   docker compose -f docker-compose.yaml --profile full up -d
+
+x-aliases:
+  blob-storage-env-vars: &blob-storage-env-vars
+    GOLEM__BLOB_STORAGE__TYPE: "LocalFileSystem"
+    GOLEM__BLOB_STORAGE__CONFIG__ROOT: "/blob_storage"
+
+services:
+  redis:
+    image: redis:${REDIS_IMAGE_VERSION:-7}
+    ports:
+      - "${REDIS_HOST_PORT:-6380}:6379"
+    volumes:
+      - redis_data:/data
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  postgres:
+    # Always available (SERVER_MODE=redis host stack uses it for registry DB).
+    image: postgres:${POSTGRES_IMAGE_VERSION:-16}
+    environment:
+      POSTGRES_DB: golem_db
+      POSTGRES_USER: golem_user
+      POSTGRES_PASSWORD: golem_password
+    ports:
+      - "${POSTGRES_HOST_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U golem_user -d golem_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # --- full stack: images built from in-tree Dockerfiles (local branch, WasmGC) ---
+  golem-registry-service:
+    profiles: ["full"]
+    image: golem-registry-service:${GOLEM_LOCAL_IMAGE_TAG:-wasmgc}
+    build:
+      context: ${GOLEM_REPO_ROOT:-../../../../..}
+      dockerfile: golem-registry-service/docker/Dockerfile
+    pull_policy: never
+    restart: on-failure
+    environment:
+      GOLEM_ENVIRONMENT: local
+      RUST_BACKTRACE: 1
+      RUST_LOG: info,h2=warn,hyper=warn,tower=warn
+      GOLEM__HTTP_PORT: ${REGISTRY_SERVICE_HTTP_PORT:-8083}
+      GOLEM__GRPC__PORT: ${REGISTRY_SERVICE_GRPC_PORT:-9008}
+      GOLEM__CORS_ORIGIN_REGEX: ${CORS_ORIGIN_REGEX:-.*}
+      # Must match golem_client::LOCAL_WELL_KNOWN_TOKEN for golem-cli builtin local auth
+      GOLEM__INITIAL_ACCOUNTS__ROOT__TOKEN: ${ADMIN_TOKEN:-5c832d93-ff85-4a8f-9803-513950fdfdb1}
+      GOLEM__INITIAL_ACCOUNTS__MARKETING__TOKEN: ${MARKETING_TOKEN:-5c832d93-ff85-4a8f-9803-513950fdfdb1}
+      GOLEM__LOGIN__TYPE: Disabled
+      GOLEM__DB__TYPE: Postgres
+      GOLEM__DB__CONFIG__DATABASE: golem_db
+      GOLEM__DB__CONFIG__MAX_CONNECTIONS: 10
+      GOLEM__DB__CONFIG__HOST: postgres
+      GOLEM__DB__CONFIG__PORT: 5432
+      GOLEM__DB__CONFIG__USERNAME: golem_user
+      GOLEM__DB__CONFIG__PASSWORD: golem_password
+      GOLEM__COMPILATION__CONFIG__HOST: golem-component-compilation-service
+      GOLEM__COMPILATION__CONFIG__PORT: ${COMPONENT_COMPILATION_SERVICE_GRPC_PORT:-9010}
+    ports:
+      # golem-cli builtin local profile defaults to http://localhost:9881
+      - "${GOLEM_ROUTER_PORT:-9881}:${REGISTRY_SERVICE_HTTP_PORT:-8083}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  golem-shard-manager:
+    profiles: ["full"]
+    image: golem-shard-manager:${GOLEM_LOCAL_IMAGE_TAG:-wasmgc}
+    build:
+      context: ${GOLEM_REPO_ROOT:-../../../../..}
+      dockerfile: golem-shard-manager/docker/Dockerfile
+    pull_policy: never
+    restart: on-failure
+    environment:
+      RUST_BACKTRACE: 1
+      RUST_LOG: info,h2=warn,hyper=warn,tower=warn
+      GOLEM__ENVIRONMENT: local
+      GOLEM__HTTP_PORT: ${SHARD_MANAGER_HTTP_PORT:-8081}
+      GOLEM__GRPC__PORT: ${SHARD_MANAGER_GRPC_PORT:-9002}
+      GOLEM__PERSISTENCE__TYPE: "Redis"
+      GOLEM__PERSISTENCE__CONFIG__HOST: redis
+      GOLEM__PERSISTENCE__CONFIG__PORT: 6379
+    depends_on:
+      - redis
+
+  golem-worker-service:
+    profiles: ["full"]
+    image: golem-worker-service:${GOLEM_LOCAL_IMAGE_TAG:-wasmgc}
+    build:
+      context: ${GOLEM_REPO_ROOT:-../../../../..}
+      dockerfile: golem-worker-service/docker/Dockerfile
+    pull_policy: never
+    restart: on-failure
+    environment:
+      RUST_BACKTRACE: 1
+      RUST_LOG: info,h2=warn,hyper=warn,tower=warn
+      GOLEM__ENVIRONMENT: local
+      GOLEM__CUSTOM_REQUEST_PORT: ${WORKER_SERVICE_CUSTOM_REQUEST_PORT:-9006}
+      GOLEM__PORT: ${WORKER_SERVICE_HTTP_PORT:-9005}
+      GOLEM__GRPC__PORT: ${WORKER_SERVICE_GRPC_PORT:-9007}
+      GOLEM__GATEWAY_SESSION_STORAGE__TYPE: "Redis"
+      GOLEM__GATEWAY_SESSION_STORAGE__CONFIG__HOST: redis
+      GOLEM__GATEWAY_SESSION_STORAGE__CONFIG__PORT: 6379
+      GOLEM__REGISTRY_SERVICE__HOST: golem-registry-service
+      GOLEM__REGISTRY_SERVICE__PORT: ${REGISTRY_SERVICE_GRPC_PORT:-9008}
+      GOLEM__ROUTING_TABLE__HOST: golem-shard-manager
+      GOLEM__ROUTING_TABLE__PORT: ${SHARD_MANAGER_GRPC_PORT:-9002}
+    ports:
+      - "${WORKER_SERVICE_CUSTOM_REQUEST_PORT:-9006}:${WORKER_SERVICE_CUSTOM_REQUEST_PORT:-9006}"
+      - "${WORKER_SERVICE_HTTP_PORT:-9005}:${WORKER_SERVICE_HTTP_PORT:-9005}"
+    depends_on:
+      - redis
+      - golem-worker-executor
+      - golem-shard-manager
+      - golem-registry-service
+
+  golem-component-compilation-service:
+    profiles: ["full"]
+    image: golem-component-compilation-service:${GOLEM_LOCAL_IMAGE_TAG:-wasmgc}
+    build:
+      context: ${GOLEM_REPO_ROOT:-../../../../..}
+      dockerfile: golem-component-compilation-service/docker/Dockerfile
+    pull_policy: never
+    restart: on-failure
+    environment:
+      <<: [*blob-storage-env-vars]
+      RUST_BACKTRACE: 1
+      RUST_LOG: info,h2=warn,hyper=warn,tower=warn
+      GOLEM__HTTP_PORT: ${COMPONENT_COMPILATION_SERVICE_HTTP_PORT:-8084}
+      GOLEM__GRPC__PORT: ${COMPONENT_COMPILATION_SERVICE_GRPC_PORT:-9010}
+      GOLEM__REGISTRY_SERVICE__TYPE: "Static"
+      GOLEM__REGISTRY_SERVICE__CONFIG__HOST: golem-registry-service
+      GOLEM__REGISTRY_SERVICE__CONFIG__PORT: ${REGISTRY_SERVICE_GRPC_PORT:-9008}
+    volumes:
+      - blob_storage:/blob_storage
+    depends_on:
+      - golem-registry-service
+
+  golem-worker-executor:
+    profiles: ["full"]
+    image: golem-worker-executor:${GOLEM_LOCAL_IMAGE_TAG:-wasmgc}
+    build:
+      context: ${GOLEM_REPO_ROOT:-../../../../..}
+      dockerfile: golem-worker-executor/docker/Dockerfile
+    pull_policy: never
+    restart: on-failure
+    environment:
+      <<: [*blob-storage-env-vars]
+      WASMTIME_BACKTRACE_DETAILS: 1
+      RUST_BACKTRACE: 1
+      RUST_LOG: info
+      GOLEM__HTTP_PORT: ${WORKER_EXECUTOR_HTTP_PORT:-8082}
+      GOLEM__GRPC__PORT: ${WORKER_EXECUTOR_GRPC_PORT:-9000}
+      # Redis-backed storage (same model as the example compose — not MultiSqlite)
+      GOLEM__KEY_VALUE_STORAGE__TYPE: "Redis"
+      GOLEM__KEY_VALUE_STORAGE__CONFIG__HOST: redis
+      GOLEM__KEY_VALUE_STORAGE__CONFIG__PORT: 6379
+      GOLEM__KEY_VALUE_STORAGE__CONFIG__DATABASE: 0
+      GOLEM__KEY_VALUE_STORAGE__CONFIG__TRACING: "false"
+      GOLEM__KEY_VALUE_STORAGE__CONFIG__TLS: "false"
+      GOLEM__KEY_VALUE_STORAGE__CONFIG__KEY_PREFIX: ""
+      GOLEM__KEY_VALUE_STORAGE__CONFIG__POOL_SIZE: 16
+      GOLEM__KEY_VALUE_STORAGE__CONFIG__RETRIES__MAX_ATTEMPTS: 5
+      GOLEM__KEY_VALUE_STORAGE__CONFIG__RETRIES__MIN_DELAY: "100ms"
+      GOLEM__KEY_VALUE_STORAGE__CONFIG__RETRIES__MAX_DELAY: "2s"
+      GOLEM__KEY_VALUE_STORAGE__CONFIG__RETRIES__MULTIPLIER: 2
+      GOLEM__KEY_VALUE_STORAGE__CONFIG__RETRIES__MAX_JITTER_FACTOR: 0.15
+      GOLEM__INDEXED_STORAGE__TYPE: "KVStoreRedis"
+      GOLEM__REGISTRY_SERVICE__HOST: golem-registry-service
+      GOLEM__REGISTRY_SERVICE__PORT: ${REGISTRY_SERVICE_GRPC_PORT:-9008}
+      GOLEM__SHARD_MANAGER_SERVICE__TYPE: "Grpc"
+      GOLEM__SHARD_MANAGER_SERVICE__CONFIG__HOST: golem-shard-manager
+      GOLEM__SHARD_MANAGER_SERVICE__CONFIG__PORT: ${SHARD_MANAGER_GRPC_PORT:-9002}
+      GOLEM__PUBLIC_WORKER_API__HOST: golem-worker-service
+      GOLEM__PUBLIC_WORKER_API__PORT: ${WORKER_SERVICE_GRPC_PORT:-9007}
+      GOLEM__COMPILED_COMPONENT_SERVICE__TYPE: "Enabled"
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - blob_storage:/blob_storage
+    depends_on:
+      - redis
+      - golem-shard-manager
+      - golem-registry-service
+
+  golem-debugging-service:
+    profiles: ["full"]
+    image: golem-debugging-service:${GOLEM_LOCAL_IMAGE_TAG:-wasmgc}
+    build:
+      context: ${GOLEM_REPO_ROOT:-../../../../..}
+      dockerfile: golem-debugging-service/docker/Dockerfile
+    pull_policy: never
+    restart: on-failure
+    environment:
+      <<: [*blob-storage-env-vars]
+      WASMTIME_BACKTRACE_DETAILS: 1
+      RUST_BACKTRACE: 1
+      RUST_LOG: info
+      GOLEM__COMPILED_COMPONENT_SERVICE__TYPE: "Enabled"
+      GOLEM__HTTP_PORT: ${DEBUGGING_SERVICE_HTTP_PORT:-8086}
+      GOLEM__KEY_VALUE_STORAGE__TYPE: "Redis"
+      GOLEM__KEY_VALUE_STORAGE__CONFIG__HOST: redis
+      GOLEM__KEY_VALUE_STORAGE__CONFIG__PORT: 6379
+      GOLEM__KEY_VALUE_STORAGE__CONFIG__DATABASE: 0
+      GOLEM__KEY_VALUE_STORAGE__CONFIG__TRACING: "false"
+      GOLEM__KEY_VALUE_STORAGE__CONFIG__TLS: "false"
+      GOLEM__KEY_VALUE_STORAGE__CONFIG__KEY_PREFIX: ""
+      GOLEM__KEY_VALUE_STORAGE__CONFIG__POOL_SIZE: 8
+      GOLEM__KEY_VALUE_STORAGE__CONFIG__RETRIES__MAX_ATTEMPTS: 5
+      GOLEM__KEY_VALUE_STORAGE__CONFIG__RETRIES__MIN_DELAY: "100ms"
+      GOLEM__KEY_VALUE_STORAGE__CONFIG__RETRIES__MAX_DELAY: "2s"
+      GOLEM__KEY_VALUE_STORAGE__CONFIG__RETRIES__MULTIPLIER: 2
+      GOLEM__KEY_VALUE_STORAGE__CONFIG__RETRIES__MAX_JITTER_FACTOR: 0.15
+      GOLEM__INDEXED_STORAGE__TYPE: "KVStoreRedis"
+      GOLEM__REGISTRY_SERVICE__HOST: golem-registry-service
+      GOLEM__REGISTRY_SERVICE__PORT: ${REGISTRY_SERVICE_GRPC_PORT:-9008}
+      GOLEM__PUBLIC_WORKER_API__HOST: golem-worker-service
+      GOLEM__PUBLIC_WORKER_API__PORT: ${WORKER_SERVICE_GRPC_PORT:-9007}
+    volumes:
+      - blob_storage:/blob_storage
+    depends_on:
+      - redis
+      - golem-registry-service
+
+volumes:
+  redis_data:
+  postgres_data:
+  blob_storage:

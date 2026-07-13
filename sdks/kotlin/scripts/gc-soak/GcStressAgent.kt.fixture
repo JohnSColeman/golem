@@ -1,0 +1,49 @@
+package example_counter
+
+import cloud.golem.BaseAgent
+import cloud.golem.annotations.Agent
+import cloud.golem.annotations.Description
+import cloud.golem.annotations.Endpoint
+import cloud.golem.annotations.Prompt
+
+/**
+ * WasmGC allocation-churn stress agent. Each /churn invoke allocates a large graph of transient
+ * objects that become unreachable before return, while rotating a small bounded live set so the
+ * collector must TRACE survivors rather than trivially freeing everything. Over a sustained soak the
+ * WasmGC heap is collected repeatedly or it OOMs -- so a plateau in the host process RSS is the
+ * observable signature that collection is running. Compiled natively to Wasm (WasmGC) via
+ * Kotlin/Wasm -- no JS, no QuickJS.
+ */
+@Agent(mount = "/gcstress/{id}", description = "WasmGC allocation-churn stress agent")
+class CounterAgent(val id: String) : BaseAgent() {
+    private var invocations: Long = 0
+    private var checksum: Long = 0
+    private val liveRing = arrayOfNulls<Any>(256)   // bounded live set -> GC must TRACE, not free-all
+    private var cursor = 0
+
+    @Prompt("Allocate and discard a large transient object graph")
+    @Description("Churns WasmGC-managed allocations; returns a running checksum")
+    @Endpoint(post = "/churn")
+    fun churn(): Long {
+        var acc = 0L
+        val scratch = ArrayList<Node>(1024)
+        repeat(CHURN_OBJECTS) { i ->                 // CHURN_OBJECTS sed-substituted per mode
+            val n = Node(i, IntArray(16) { it + i }, "s$i")
+            acc += n.arr[i and 15] + n.label.length
+            scratch.add(n)
+            if (scratch.size >= 1024) { acc += scratch[0].id; scratch.clear() } // let them die
+        }
+        liveRing[cursor % liveRing.size] = ByteArray(1024)   // rotate a bounded live set
+        cursor++
+        invocations++
+        checksum = checksum * 31 + acc               // RETURNED -> defeats dead-code elimination
+        return checksum
+    }
+
+    @Prompt("Get cumulative churn stats")
+    @Description("Returns invocation count, checksum, and current live-set size")
+    @Endpoint(get = "/stats")
+    fun stats(): String = "OK inv=$invocations checksum=$checksum live=${liveRing.count { it != null }}"
+}
+
+private class Node(val id: Int, val arr: IntArray, val label: String)
