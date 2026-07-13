@@ -102,7 +102,10 @@ echo "== deploy =="
 
 echo "== warm a few agents =="
 for i in 0 1 2; do
-  curl -s -o /dev/null -X POST "http://localhost:$CUSTOM_PORT/gcstress/$i/churn" -H 'Host: app.localhost:9006' || true
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 120 \
+    -X POST "http://localhost:$CUSTOM_PORT/gcstress/$i/churn" \
+    -H 'Host: app.localhost:9006' || echo 000)
+  echo "  warm agent $i -> HTTP $code"
 done
 
 echo "== start RSS sampler (pid=$RSS_TARGET_PID) =="
