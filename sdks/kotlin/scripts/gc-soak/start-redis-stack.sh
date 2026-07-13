@@ -115,6 +115,9 @@ start_infra() {
     echo "== infra (docker): redis :$REDIS_PORT + postgres :$PG_PORT =="
     export REDIS_HOST_PORT="$REDIS_PORT"
     export POSTGRES_HOST_PORT="$PG_PORT"
+    # Always recreate volumes so Postgres component metadata cannot outlive a wiped
+    # filesystem blob root (that mismatch causes ComponentDownloadFailed / empty component_store).
+    "${COMPOSE[@]}" -f "$DOCKER_DIR/docker-compose.yaml" -p gcsoak down -v --remove-orphans >/dev/null 2>&1 || true
     "${COMPOSE[@]}" -f "$DOCKER_DIR/docker-compose.yaml" -p gcsoak up -d redis postgres
 
     for _ in $(seq 1 60); do
@@ -128,7 +131,7 @@ start_infra() {
     for _ in $(seq 1 60); do
       pcid=$("${COMPOSE[@]}" -f "$DOCKER_DIR/docker-compose.yaml" -p gcsoak ps -q postgres 2>/dev/null || true)
       if [ -n "$pcid" ] && docker exec "$pcid" pg_isready -U "$PG_USER" -d "$PG_DB" >/dev/null 2>&1; then
-        echo "  postgres ready on host :$PG_PORT"
+        echo "  postgres ready on host :$PG_PORT (fresh volume)"
         return 0
       fi
       sleep 1
@@ -136,15 +139,18 @@ start_infra() {
     fail "postgres not ready"
   fi
 
-  command -v redis-server >/dev/null 2>&1 || fail "docker unavailable and redis-server not found"
   fail "docker required for Postgres registry (compose). Start Colima and retry."
 }
 start_infra
 
-# Flush redis so no stale executor registrations
-redis-cli -h 127.0.0.1 -p "$REDIS_PORT" FLUSHALL >/dev/null
+# Shared blob root for registry + executor (component_store lives here).
+# Created before services start so both open the same directory.
+BLOB_ROOT="$WORKDIR/data/blob"
+mkdir -p "$BLOB_ROOT"
+chmod 755 "$BLOB_ROOT"
+echo "  blob root: $BLOB_ROOT"
 
-echo "== registry-service (Postgres) =="
+echo "== registry-service (Postgres + shared blob) =="
 start_svc registry "$WORKDIR/logs/registry.log" "$ROOT/golem-registry-service" \
   GOLEM__HTTP_PORT="$REGISTRY_HTTP" \
   GOLEM__GRPC__PORT="$REGISTRY_GRPC" \
@@ -160,7 +166,7 @@ start_svc registry "$WORKDIR/logs/registry.log" "$ROOT/golem-registry-service" \
   GOLEM__DB__CONFIG__PASSWORD="$PG_PASS" \
   GOLEM__DB__CONFIG__MAX_CONNECTIONS=20 \
   GOLEM__BLOB_STORAGE__TYPE=LocalFileSystem \
-  GOLEM__BLOB_STORAGE__CONFIG__ROOT="$WORKDIR/data/blob" \
+  GOLEM__BLOB_STORAGE__CONFIG__ROOT="$BLOB_ROOT" \
   GOLEM__CORS_ORIGIN_REGEX=".*" \
   GOLEM__INITIAL_ACCOUNTS__ROOT__TOKEN="$ADMIN_TOKEN" \
   RUST_LOG=info,h2=warn,hyper=warn,tower=warn \
@@ -173,7 +179,7 @@ start_svc compilation "$WORKDIR/logs/compilation.log" "$ROOT/golem-component-com
   GOLEM__HTTP_PORT="$COMPILATION_HTTP" \
   GOLEM__GRPC__PORT="$COMPILATION_GRPC" \
   GOLEM__BLOB_STORAGE__TYPE=LocalFileSystem \
-  GOLEM__BLOB_STORAGE__CONFIG__ROOT="$WORKDIR/data/blob" \
+  GOLEM__BLOB_STORAGE__CONFIG__ROOT="$BLOB_ROOT" \
   GOLEM__REGISTRY_SERVICE__CONFIG__HOST=localhost \
   GOLEM__REGISTRY_SERVICE__CONFIG__PORT="$REGISTRY_GRPC" \
   RUST_LOG=info,h2=warn,hyper=warn,tower=warn \
@@ -204,7 +210,7 @@ start_svc worker_executor "$WORKDIR/logs/worker-executor.log" "$ROOT/golem-worke
   GOLEM__PUBLIC_WORKER_API__HOST=localhost \
   GOLEM__PUBLIC_WORKER_API__PORT="$WORKER_GRPC" \
   GOLEM__BLOB_STORAGE__TYPE=LocalFileSystem \
-  GOLEM__BLOB_STORAGE__CONFIG__ROOT="$WORKDIR/data/blob" \
+  GOLEM__BLOB_STORAGE__CONFIG__ROOT="$BLOB_ROOT" \
   GOLEM__REGISTRY_SERVICE__HOST=localhost \
   GOLEM__REGISTRY_SERVICE__PORT="$REGISTRY_GRPC" \
   GOLEM__SHARD_MANAGER__HOST=127.0.0.1 \
@@ -311,8 +317,9 @@ REGISTRY_HTTP=$REGISTRY_HTTP
 EXECUTOR_PID=$EXECUTOR_PID
 REDIS_PORT=$REDIS_PORT
 PG_PORT=$PG_PORT
+BLOB_ROOT=$BLOB_ROOT
 ADMIN_TOKEN=$ADMIN_TOKEN
 GOLEM_BUILTIN_LOCAL_URL=$GOLEM_URL
 EOF
 
-echo "== stack ready (Postgres registry + Redis executor KV/indexed): custom=:$CUSTOM_PORT golem_url=$GOLEM_URL executor_pid=$EXECUTOR_PID =="
+echo "== stack ready (Postgres registry + Redis executor + shared blob $BLOB_ROOT): custom=:$CUSTOM_PORT golem_url=$GOLEM_URL executor_pid=$EXECUTOR_PID =="

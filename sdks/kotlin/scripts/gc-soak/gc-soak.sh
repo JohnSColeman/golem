@@ -100,12 +100,23 @@ fi
 echo "== deploy =="
 (cd "$APP" && "$GOLEM_CLI" deploy --yes) || fail "deploy"
 
+# Fail fast if registry never stored the wasm in the shared blob root.
+if [ "$SERVER_MODE" = "redis" ]; then
+  # shellcheck disable=SC1090
+  set -a; source "$WORKDIR/stack.env"; set +a
+  BLOB_ROOT="${BLOB_ROOT:-$WORKDIR/data/blob}"
+  n_blob=$(find "$BLOB_ROOT/component_store" -type f 2>/dev/null | wc -l | tr -d ' ')
+  echo "  component_store files under $BLOB_ROOT: $n_blob"
+  [ "${n_blob:-0}" -ge 1 ] || fail "deploy left component_store empty (blob/registry mismatch); see $WORKDIR/logs/registry-service.log"
+fi
+
 echo "== warm a few agents =="
 for i in 0 1 2; do
   code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 120 \
     -X POST "http://localhost:$CUSTOM_PORT/gcstress/$i/churn" \
     -H 'Host: app.localhost:9006' || echo 000)
   echo "  warm agent $i -> HTTP $code"
+  [ "$code" = "200" ] || fail "warm agent $i returned HTTP $code (expected 200); component download likely broken"
 done
 
 echo "== start RSS sampler (pid=$RSS_TARGET_PID) =="
