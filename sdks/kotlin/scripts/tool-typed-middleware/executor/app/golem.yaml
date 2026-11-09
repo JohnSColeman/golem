@@ -1,0 +1,89 @@
+manifestVersion: 1.6.0
+
+app: probe
+
+environments:
+  local:
+    server: local
+    componentPresets: release
+
+components:
+  probe:provider:
+    dir: ../probe-provider
+    templates: rust
+  example:typed:
+    dir: ""
+    templates: kotlin
+
+tools:
+  middleware-probe:
+    component: probe:provider
+  arg-probe:
+    component: probe:provider
+  stream-probe:
+    component: probe:provider
+  git-probe:
+    component: probe:provider
+  remote:
+    component: probe:provider
+  kt-lookup:
+    component: example:typed
+  kt-upper:
+    component: example:typed
+  backend-probe:
+    component: probe:provider
+  middleware:
+    probe-adapter:
+      component: example:typed
+    typed-audit:
+      component: example:typed
+    arg-audit:
+      component: example:typed
+    stream-audit:
+      component: example:typed
+    git-audit:
+      component: example:typed
+    refined-adapter:
+      component: example:typed
+
+agents:
+  KtToolsCaller:
+    tools:
+      kt-lookup: { }
+      kt-upper: { }
+      remote: { }
+  ArgCaller:
+    tools:
+      arg-probe:
+        middleware:
+        - arg-audit
+      stream-probe:
+        middleware:
+        - stream-audit
+      git-probe:
+        middleware:
+        - git-audit
+  RefinedCaller:
+    tools:
+      backend-probe:
+        middleware:
+        - name: refined-adapter
+  ProbeCaller:
+    tools:
+      middleware-probe:
+        middleware:
+        - typed-audit
+  AdaptedCaller:
+    tools:
+      backend-probe:
+        middleware:
+        - name: probe-adapter
+          parameters:
+            text: pfx
+
+httpApi:
+  deployments:
+    local:
+    - domain: localhost:9006
+      agents:
+        WebhookCaller: { }

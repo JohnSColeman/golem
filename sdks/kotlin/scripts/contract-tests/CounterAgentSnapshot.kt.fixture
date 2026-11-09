@@ -1,0 +1,137 @@
+package example_counter
+
+import cloud.golem.BaseAgent
+import cloud.golem.CustomSnapshot
+import cloud.golem.MultipartSnapshot
+import cloud.golem.MultipartSnapshotted
+import cloud.golem.SnapshotPart
+import cloud.golem.Snapshotted
+import cloud.golem.annotations.Agent
+import cloud.golem.annotations.Description
+import cloud.golem.annotations.Endpoint
+import cloud.golem.annotations.Prompt
+
+data class CounterState(val value: Int)
+
+data class LedgerState(val label: String, val total: Int)
+
+/**
+ * A durable counter agent with typed snapshot support.
+ *
+ * Mounted at /counters/{name}: each unique {name} is a separate agent instance with its own
+ * persistent state, managed durably by Golem. Compiled directly to Wasm (WasmGC) via
+ * Kotlin/Wasm -- no JavaScript, no QuickJS. The KSP processor reads these annotations at
+ * compile time and generates the actual `@WasmExport` guest functions + agent metadata.
+ */
+@Agent(mount = "/counters/{name}", description = "A durable counter agent")
+class CounterAgent(val name: String) : BaseAgent(), Snapshotted<CounterState> {
+    override var state = CounterState(0)
+
+    @Prompt("Increase the count by one")
+    @Description("Increments the counter and returns the new value")
+    @Endpoint(post = "/increment")
+    fun increment(): Int {
+        state = CounterState(state.value + 1)
+        return state.value
+    }
+
+    @Prompt("Get the current counter value")
+    @Description("Returns the current value without modifying it")
+    @Endpoint(get = "/value")
+    fun getValue(): Int = state.value
+}
+
+/**
+ * Custom-byte snapshots: the agent encodes its own state, rather than letting KSP derive a codec
+ * from a typed `Snapshotted<S>`. The runtime still wraps the bytes in the principal envelope and
+ * rebuilds the agent from its id before `loadSnapshot` runs.
+ */
+@Agent(mount = "/custom/{name}", description = "Custom-byte snapshot agent")
+class CustomSnapshotAgent(val name: String) : BaseAgent(), CustomSnapshot {
+    private var total: Int = 0
+
+    @Endpoint(post = "/add")
+    fun add(by: Int): Int {
+        total += by
+        return total
+    }
+
+    @Endpoint(get = "/total")
+    fun getTotal(): Int = total
+
+    override fun saveSnapshot(): ByteArray = total.toString().encodeToByteArray()
+
+    override fun loadSnapshot(bytes: ByteArray) {
+        total = bytes.decodeToString().toInt()
+    }
+}
+
+/**
+ * Multipart snapshots: state is saved as several named, content-typed parts and read back by name.
+ * `requirePart` fails loudly if a part is missing or carries the wrong content type.
+ */
+@Agent(mount = "/multi/{name}", description = "Multipart snapshot agent")
+class MultipartSnapshotAgent(val name: String) : BaseAgent(), MultipartSnapshotted {
+    private var history: MutableList<Int> = mutableListOf()
+
+    @Endpoint(post = "/push")
+    fun push(v: Int): Int {
+        history.add(v)
+        return history.size
+    }
+
+    @Endpoint(get = "/history")
+    fun getHistory(): String = history.joinToString(",")
+
+    override fun saveSnapshotParts(): MultipartSnapshot = MultipartSnapshot(
+        mapOf(
+            "count" to SnapshotPart(history.size.toString().encodeToByteArray(), "text/plain"),
+            "values" to SnapshotPart(history.joinToString(",").encodeToByteArray(), "text/plain"),
+        ),
+    )
+
+    override fun loadSnapshotParts(snapshot: MultipartSnapshot) {
+        val values = snapshot.requirePart("values", "text/plain").decodeToString()
+        history = if (values.isEmpty()) mutableListOf() else values.split(",").map { it.toInt() }.toMutableList()
+    }
+}
+
+/**
+ * Typed state beside multipart parts: the agent mixes in both, so KSP derives a codec for `state`
+ * and puts it in the frame's state slot while the agent keeps its own named parts. The part named
+ * `state` is here on purpose -- it proves the typed state travels in a slot of its own and cannot
+ * collide with a part of that name. `stateSeenAtPartsLoad` records what `state` held when
+ * `loadSnapshotParts` ran, which pins the documented order: the typed state is restored first.
+ */
+@Agent(mount = "/ledger/{name}", description = "Typed state beside multipart snapshot parts")
+class LedgerAgent(val name: String) : BaseAgent(), Snapshotted<LedgerState>, MultipartSnapshotted {
+    override var state = LedgerState("fresh", 0)
+    private var entries: MutableList<Int> = mutableListOf()
+    private var stateSeenAtPartsLoad: String = "none"
+
+    @Endpoint(post = "/record")
+    fun record(amount: Int): Int {
+        entries.add(amount)
+        state = LedgerState("recorded", state.total + amount)
+        return state.total
+    }
+
+    @Endpoint(get = "/summary")
+    fun getSummary(): String = "${state.label}:${state.total}:${entries.joinToString("|")}:$stateSeenAtPartsLoad"
+
+    override fun saveSnapshotParts(): MultipartSnapshot = MultipartSnapshot(
+        mapOf(
+            "state" to SnapshotPart("a part, not the slot".encodeToByteArray(), "text/plain"),
+            "entries" to SnapshotPart(entries.joinToString("|").encodeToByteArray(), "text/plain"),
+        ),
+    )
+
+    override fun loadSnapshotParts(snapshot: MultipartSnapshot) {
+        stateSeenAtPartsLoad = state.label
+        require(snapshot.requirePart("state", "text/plain").decodeToString() == "a part, not the slot") {
+            "the part named 'state' was overwritten by the typed state slot"
+        }
+        val values = snapshot.requirePart("entries", "text/plain").decodeToString()
+        entries = if (values.isEmpty()) mutableListOf() else values.split("|").map { it.toInt() }.toMutableList()
+    }
+}

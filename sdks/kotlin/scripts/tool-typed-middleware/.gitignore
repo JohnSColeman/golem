@@ -1,0 +1,12 @@
+build/
+.gradle/
+.kotlin/
+executor/app/golem-temp/
+executor/app/.agents/
+executor/app/.claude/
+executor/app/AGENTS.md
+executor/app/gradlew
+executor/app/gradlew.bat
+executor/app/gradle/
+executor/probe-provider/target/
+executor/run.log

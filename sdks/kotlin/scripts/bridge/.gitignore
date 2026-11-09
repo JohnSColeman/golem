@@ -1,0 +1,13 @@
+build/
+.gradle/
+.kotlin/
+app/golem-temp/
+app/.agents/
+app/.claude/
+app/AGENTS.md
+app/gradlew
+app/gradlew.bat
+app/gradle/
+external/gradlew
+external/gradlew.bat
+external/gradle/

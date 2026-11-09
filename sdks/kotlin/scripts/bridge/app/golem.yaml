@@ -1,0 +1,56 @@
+manifestVersion: 1.6.0
+
+app: bridge
+
+environments:
+  local:
+    server: local
+    componentPresets: release
+
+components:
+  bridge:provider:
+    dir: provider
+    templates: kotlin
+  bridge:consumer:
+    dir: consumer
+    templates: kotlin
+    dependencies:
+      agents:
+        - bridge:provider/Calculator
+      tools:
+        - arg-probe
+        - stream-probe
+        - git-probe
+  probe:provider:
+    dir: ../../tool-typed-middleware/executor/probe-provider
+    templates: rust
+
+tools:
+  arg-probe:
+    component: probe:provider
+  stream-probe:
+    component: probe:provider
+  git-probe:
+    component: probe:provider
+  remote:
+    component: probe:provider
+  middleware-probe:
+    component: probe:provider
+  backend-probe:
+    component: probe:provider
+
+agents:
+  ToolBridgeCaller:
+    tools:
+      arg-probe: { }
+      stream-probe: { }
+      git-probe: { }
+      remote: { }
+
+httpApi:
+  deployments:
+    local:
+      - domain: localhost:9006
+        agents:
+          Secured:
+            testSessionHeaderName: x-golem-test-session
